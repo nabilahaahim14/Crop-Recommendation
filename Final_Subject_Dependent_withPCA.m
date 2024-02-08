@@ -1,0 +1,280 @@
+% Load the dataset
+unzip('GTdb_crop.zip', 'cropped_faces');
+
+% Create an imageDatastore and assign labels
+imds = imageDatastore('cropped_faces');
+imds.Labels = filenames2labels(imds.Files, "ExtractBetween", [1 3]);
+
+
+
+% Split the dataset into training and validation sets (10 images for training, 5 for validation)
+[imdsTrain, imdsValidation] = splitEachLabel(imds, 10, 'randomize');
+
+
+net = vgg19;
+
+% Check the input size of the VGG19 model
+inputSize = net.Layers(1).InputSize;
+
+% Replace the classification head with a new one for your task
+layersTransfer = net.Layers(1:end-3);
+numClasses = numel(categories(imdsTrain.Labels));
+layers = [layersTransfer;
+    dropoutLayer(0.5);
+    fullyConnectedLayer(numClasses, 'WeightLearnRateFactor', 20, 'BiasLearnRateFactor', 20);
+    softmaxLayer;
+    classificationLayer];
+
+
+% Data augmentation configuration
+pixelRange = [-15,15];
+imageAugmenter = imageDataAugmenter(...
+    'RandXReflection', true, ...
+    'RandXTranslation', pixelRange, ...
+    'RandYTranslation', pixelRange);
+% Apply the custom preprocessing function to the original image datastores
+
+
+imdsTrainProcessed = imageDatastore(imdsTrain.Files, 'Labels', imdsTrain.Labels, 'ReadFcn', @customReadFcn);
+imdsValidationProcessed = imageDatastore(imdsValidation.Files, 'Labels', imdsValidation.Labels, 'ReadFcn', @customReadFcn);
+
+% Create augmented image datastores using the processed imageDatastores
+augimdsTrain = augmentedImageDatastore(inputSize, imdsTrainProcessed, 'DataAugmentation', imageAugmenter);
+augimdsValidation = augmentedImageDatastore(inputSize, imdsValidationProcessed);
+
+options = trainingOptions('sgdm', ...
+    'MiniBatchSize', 80, ...
+    'MaxEpochs', 20, ...
+    'InitialLearnRate', 1e-4, ...
+    'L2Regularization', 1e-4, ... % Assuming you're adding L2 regularization
+    'Shuffle', 'every-epoch', ...
+    'ValidationData', augimdsValidation, ...
+    'ValidationFrequency', 3, ...
+    'ValidationPatience', 5, ... % Early stopping parameter
+    'Verbose', false, ...
+    'Plots', 'training-progress');
+
+
+
+% Step 6: Train the network
+netTransfer = trainNetwork(augimdsTrain, layers, options);
+
+
+% Fine-tuning parameters
+fineTuneLearningRate = 1e-5;
+fineTuneEpochs = 5; % number of epochs per fine-tuning round
+
+for i = 1:4 % 4 rounds of fine-tuning
+    fprintf('Starting fine-tuning round %d\n', i);
+    
+    % Adjust the learning rate for fine-tuning
+    fineTuneOptions = trainingOptions('sgdm', ...
+        'MiniBatchSize', 80, ...
+        'MaxEpochs', fineTuneEpochs, ...
+        'InitialLearnRate', fineTuneLearningRate, ...
+        'Shuffle', 'every-epoch', ...
+        'ValidationData', augimdsValidation, ...
+        'ValidationFrequency', 3, ...
+        'ValidationPatience', 5, ...
+        'Verbose', false, ...
+        'Plots', 'training-progress');
+
+    % Train the network with the updated options
+    netTransfer = trainNetwork(augimdsTrain, netTransfer.Layers, fineTuneOptions);
+
+    %%Evaluate the network on validation set after each round
+    [YPred, scores] = classify(netTransfer, augimdsValidation);
+    YValidation = imdsValidation.Labels;
+    accuracy = mean(YPred == YValidation);
+    fprintf('Validation accuracy after fine-tuning round %d: %.4f\n', i, accuracy);
+end
+
+
+% Step 7: Test the network and extract features
+[YPred,scores] = classify(netTransfer,augimdsValidation);
+
+ YValidation = imdsValidation.Labels;
+ accuracy = mean(YPred == YValidation)
+
+idx = randperm(numel(imdsValidation.Files),16);
+figure
+for i = 1:16
+    subplot(4,4,i)
+    I = readimage(imdsValidation,idx(i));
+    imshow(I)
+    label = strcat('Pred: ',cellstr(YPred(idx(i))),' Actual: ',cellstr(YValidation(idx(i))));
+    title(string(label));
+end
+
+layer = 'fc7';
+featuresTrain = activations(netTransfer,augimdsTrain,layer,'OutputAs','rows');
+featuresValidation = activations(netTransfer,augimdsValidation,layer,'OutputAs','rows');
+% Assuming you have extracted featuresTrain
+
+% Fit PCA on training features
+[coeff, scoreTrain, ~, ~, explained] = pca(featuresTrain);
+
+% Keep only the components that explain a certain percentage of variance
+explainedVarianceToKeep = 95; % for example, 95%
+cumulativeExplained = cumsum(explained);
+numComponents = find(cumulativeExplained >= explainedVarianceToKeep, 1, 'first');
+
+% Reduce dimensionality of training features
+reducedFeaturesTrain = scoreTrain(:, 1:numComponents);
+
+
+% Reduce dimensionality of validation features using the same PCA transformation
+reducedFeaturesValidation = featuresValidation * coeff(:, 1:numComponents);
+
+
+
+% Part 3 - Calculate cosine similarity scores
+
+% Initialization
+genuineScores = [];
+impostorScores = [];
+numSubjects = numel(unique(imdsValidation.Labels)); % Number of unique subjects
+
+
+% Iterate over each subject
+for subject = 1:numSubjects
+    % Convert subject index to categorical in the format 's01', 's02', etc.
+    subjectCat = categorical({sprintf('s%02d', subject)});
+
+    % Find indices of images for the current subject
+    subjectIndices = find(imdsValidation.Labels == subjectCat);
+
+    % Check if there are images for the current subject
+    if isempty(subjectIndices)
+        continue; % Skip to the next subject if no images are found
+    end
+
+    % Use the first image as the enrollment image
+    enrollmentIdx = subjectIndices(1);
+    enrollmentFeatures = reducedFeaturesValidation(enrollmentIdx, :);
+
+    % Genuine scores: Compare with remaining images of the same subject
+    for i = 2:length(subjectIndices)
+        genuineScore = 1 - pdist2(enrollmentFeatures, reducedFeaturesValidation(subjectIndices(i), :), 'cosine');
+        genuineScores = [genuineScores; genuineScore];
+    end
+
+    % Impostor scores: Compare with one image from each of the other subjects
+    for otherSubject = 1:numSubjects
+        if otherSubject ~= subject
+            % Convert other subject index to categorical in the format 's01', 's02', etc.
+            otherSubjectCat = categorical({sprintf('s%02d', otherSubject)});
+
+            otherSubjectIdx = find(imdsValidation.Labels == otherSubjectCat, 1, 'first');
+            if isempty(otherSubjectIdx)
+                continue; % Skip if no image is found for the other subject
+            end
+
+            impostorScore = 1 - pdist2(enrollmentFeatures, reducedFeaturesValidation(otherSubjectIdx, :), 'cosine');
+            impostorScores = [impostorScores; impostorScore];
+        end
+    end
+end
+
+%Part 4 - Plot testing score distribution histograms
+figure;
+histogram(genuineScores, 'Normalization', 'probability', 'DisplayName', 'Genuine Scores');
+hold on;
+histogram(impostorScores, 'Normalization', 'probability', 'DisplayName', 'Impostor Scores');
+xlabel('Cosine Similarity Scores');
+ylabel('Probability');
+title('Testing Score Distribution');
+legend;
+
+% Part 5 - Calculate ROC curve
+labels = [ones(size(genuineScores)); zeros(size(impostorScores))];
+scores = [genuineScores; impostorScores];
+[~, ~, ~, auc] = perfcurve(labels, scores, 1);
+[Xroc, Yroc, T, AUC] = perfcurve(labels, scores, 1);
+figure; 
+plot(Xroc, Yroc);
+xlabel('False Positive Rate'); 
+ylabel('True Positive Rate');
+title(['ROC Curve, AUC = ' num2str(AUC)]);
+
+
+% Part 6 - Calculate d' (d-prime)
+meanGenuine = mean(genuineScores);
+stdGenuine = std(genuineScores);
+meanImpostor = mean(impostorScores);
+stdImpostor = std(impostorScores);
+
+dPrime = (meanGenuine - meanImpostor) / sqrt((stdGenuine^2 + stdImpostor^2) / 2);
+
+% Display ROC AUC and d' (d-prime)
+fprintf('ROC AUC: %.4f\n', auc);
+fprintf('d'' (d-prime): %.4f\n', dPrime);
+
+
+uniqueLabels = unique(imdsValidation.Labels);
+probeIndices = [];
+galleryIndices = [];
+
+% Splitting the dataset into probe and gallery sets
+for i = 1:length(uniqueLabels)
+    currentLabelIndices = find(imdsValidation.Labels == uniqueLabels(i));
+    probeIndices = [probeIndices; currentLabelIndices(1)]; % First image of each identity as probe
+    galleryIndices = [galleryIndices; currentLabelIndices(2:end)]; % Rest as gallery
+end
+
+% Extract features and labels based on these indices
+probeFeatures = reducedFeaturesValidation(probeIndices, :);
+galleryFeatures = reducedFeaturesValidation(galleryIndices, :);
+probeLabels = double(imdsValidation.Labels(probeIndices));
+galleryLabels = double(imdsValidation.Labels(galleryIndices));
+
+% Initialize counts for rank 1 and rank 5 identification rates
+rank1Count = 0;
+rank5Count = 0;
+
+% Iterate over each probe feature
+% Print lengths of arrays for diagnostic purposes
+fprintf('Length of probeFeatures: %d\n', length(probeFeatures));
+fprintf('Length of galleryLabels: %d\n', length(galleryLabels));
+numProbes = size(probeFeatures, 1);
+fprintf('Number of probe images: %d\n', numProbes);
+% Loop should iterate over the length of probeFeatures
+for i = 1:numProbes
+    fprintf('Processing probe %d\n', i);
+
+    % Compute similarities with galleryFeatures
+    similarities = 1 - pdist2(probeFeatures(i, :), galleryFeatures, 'cosine');
+
+    % Sort similarities and get indices
+    [sorted, indices] = sort(similarities, 'descend');
+
+    % Adjust the indices to ensure they are within bounds
+    indices = indices(indices <= length(galleryLabels));
+    topIndices = min(5, length(indices));
+    
+    % Diagnostic print to check index ranges
+    fprintf('Top index for probe %d: %d\n', i, topIndices);
+
+    % Access the top labels
+    top5Labels = galleryLabels(indices(1:topIndices));
+
+    % Check for rank 1 and rank 5 matches
+    if any(probeLabels(i) == top5Labels)
+        rank5Count = rank5Count + 1;
+        if probeLabels(i) == top5Labels(1)
+            rank1Count = rank1Count + 1;
+        end
+    end
+
+    % Break the loop if it exceeds the length of galleryLabels
+    if i >= length(galleryLabels)
+        fprintf('Breaking loop at probe %d to avoid exceeding galleryLabels bounds\n', i);
+        break;
+    end
+end
+
+% Calculate and print rank 1 and rank 5 identification rates with threshold
+rank1RateThreshold = rank1Count / numProbes;
+rank5RateThreshold = rank5Count / numProbes;
+fprintf('Rank 1 Identification Rate with Threshold: %.4f\n', rank1RateThreshold);
+fprintf('Rank 5 Identification Rate with Threshold: %.4f\n', rank5RateThreshold);
